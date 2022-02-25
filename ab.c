@@ -149,7 +149,11 @@
 #include <apr_portable.h>
 #include <apr_poll.h>
 #include "ap_release.h"
-
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <semaphore.h>
+#include <string.h>
+#include <errno.h>
 
 
 #define APR_WANT_STRFUNC
@@ -348,6 +352,10 @@ int err_conn = 0;          /* requests failed due to connection drop */
 int err_recv = 0;          /* requests failed due to broken read */
 int err_except = 0;        /* requests failed due to exception */
 int err_response = 0;      /* requests with invalid or non-200 response */
+
+int worker_num = 1;
+char ab_work_sem [80] = {0};
+#define AB_WORKER_SEM  ab_work_sem
 
 #ifdef USE_SSL
 int is_ssl;
@@ -2140,12 +2148,15 @@ static int open_postfile(const char *pfile)
 /* sort out command-line args and call test */
 int main(int argc, const char * const argv[])
 {
-    int r, l;
+    int r, l,i;
     char tmp[1024];
     apr_status_t status;
     apr_getopt_t *opt;
     const char *optarg;
     char c;
+    sem_t *worker_sem;
+    int inited_worker_num = 0;
+
 #ifdef USE_SSL
 #if OPENSSL_VERSION_NUMBER >= 0x00909000
     const SSL_METHOD *meth = SSLv23_client_method();
@@ -2344,6 +2355,9 @@ int main(int argc, const char * const argv[])
             case 'V':
                 copyright();
                 return 0;
+            case 'W':
+                worker_num = atoi(optarg);
+                break;
 #ifdef USE_SSL
             case 'Z':
                 ssl_cipher = strdup(optarg);
@@ -2420,7 +2434,8 @@ int main(int argc, const char * const argv[])
     }
     SSL_CTX_set_options(ssl_ctx, SSL_OP_ALL);
     if (ssl_cipher != NULL) {
-        if (!SSL_CTX_set_cipher_list(ssl_ctx, ssl_cipher)) {
+        if (!SSL_CTX_set_cipher_list(ssl_ctx, ssl_cipher) &&
+            !SSL_CTX_set_ciphersuites(ssl_ctx, ssl_cipher)) {
             fprintf(stderr, "error setting cipher list [%s]\n", ssl_cipher);
         ERR_print_errors_fp(stderr);
         exit(1);
@@ -2435,6 +2450,26 @@ int main(int argc, const char * const argv[])
                                          * have been closed at the other end. */
 #endif
     copyright();
+    snprintf(AB_WORKER_SEM, sizeof(AB_WORKER_SEM), "ab_worker_sem_%d", getpid());
+    sem_unlink(AB_WORKER_SEM);
+    if ((worker_sem = sem_open(AB_WORKER_SEM, O_CREAT | O_EXCL | O_RDWR, 0644, 0)) == NULL) {
+        fprintf(stderr, "sem_open fail (%s)!\n", strerror(errno));
+        return 0;
+    }
+
+    for (i = 1; i < worker_num; i++) {
+        if (fork() == 0)
+            break;
+    }
+    sem_post(worker_sem);
+    while (1) {
+        sem_getvalue(worker_sem, &inited_worker_num);
+        if (inited_worker_num >= worker_num) {
+            break;
+        }
+    }
+    sem_close(worker_sem);
+    sem_unlink(AB_WORKER_SEM);
     test();
     apr_pool_destroy(cntxt);
 
