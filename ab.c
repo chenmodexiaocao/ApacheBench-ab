@@ -169,6 +169,7 @@
 #include <unistd.h> /* for getpid() */
 #endif
 
+#define HAVE_OPENSSL
 /*
 #if !defined(WIN32) && !defined(NETWARE)
 #include "ap_config_auto.h"
@@ -246,6 +247,8 @@ struct connection {
     apr_socket_t *aprsock;
     apr_pollfd_t pollfd;
     int state;
+
+    int tunnel_up;        /* the tunnel is up, 0: down, 1: upping, 2, up */
     apr_size_t read;            /* amount of bytes read */
     apr_size_t bread;           /* amount of body read */
     apr_size_t rwrite, rwrote;  /* keep pointers in what we write - across
@@ -299,6 +302,7 @@ char *hostname;         /* host name from URL */
 char *host_field;       /* value of "Host:" header field */
 char *path;             /* path name */
 char postfile[1024];    /* name of file containing post data */
+int forward_conn = 0;   /* Connect before ssl handshake, bcui */
 char *postdata;         /* *buffer containing data from postfile */
 apr_size_t postlen = 0; /* length of data to be POSTed */
 char content_type[1024];/* content type to put in POST header */
@@ -354,6 +358,11 @@ BIO *bio_out,*bio_err;
 #endif
 
 apr_time_t start, lasttime, stoptime;
+
+/* global http connect */
+char _conn_request[2048];
+char *conn_request = _conn_request;
+apr_size_t conn_reqlen;
 
 /* global request (and its length) */
 char _request[2048];
@@ -728,6 +737,50 @@ static void write_request(struct connection * c)
 
     c->endwrite = lasttime = apr_time_now();
     set_conn_state(c, STATE_READ);
+}
+
+static void write_conn_request(struct connection * c)
+{
+    do {
+        apr_time_t tnow;
+        apr_size_t l = conn_reqlen;
+        apr_status_t e = APR_SUCCESS; /* prevent gcc warning */
+
+        tnow = lasttime = apr_time_now();
+
+        /*
+         * First time round ?
+         */
+        if (c->rwrite == 0) {
+            apr_socket_timeout_set(c->aprsock, 0);
+            c->connect = tnow;
+            c->rwrote = 0;
+            c->rwrite = conn_reqlen;
+            if (posting)
+                c->rwrite += postlen;
+        }
+        else if (tnow > c->connect + aprtimeout) {
+            printf("Send http-connect request timed out!\n");
+            close_connection(c);
+            return;
+        }
+
+        e = apr_socket_send(c->aprsock, conn_request+ c->rwrote, &l);
+
+        if (e != APR_SUCCESS && !APR_STATUS_IS_EAGAIN(e)) {
+            epipe++;
+            printf("Send http-connect request failed!\n");
+            close_connection(c);
+            return;
+        }
+        totalposted += l;
+        c->rwrote += l;
+        c->rwrite -= l;
+    } while (c->rwrite);
+
+    c->endwrite = lasttime = apr_time_now();
+
+    //set_conn_state(c, STATE_READ);
 }
 
 /* --------------------------------------------------------- */
@@ -1181,7 +1234,7 @@ static void start_connect(struct connection * c)
 
     if (!(started < requests))
     return;
-
+    c->tunnel_up = 0;
     c->read = 0;
     c->bread = 0;
     c->keepalive = 0;
@@ -1561,6 +1614,58 @@ static void read_connection(struct connection * c)
 
 /* --------------------------------------------------------- */
 
+/* read data from connection */
+
+static int read_connection_conn_ack(struct connection * c)
+{
+    apr_size_t r;
+    apr_status_t status;
+    char *part;
+    char respcode[4];       /* 3 digits and null */
+
+    r = sizeof(buffer);
+    {
+        status = apr_socket_recv(c->aprsock, buffer, &r);
+        if (APR_STATUS_IS_EAGAIN(status))
+            return 1;
+        else if (r == 0 && APR_STATUS_IS_EOF(status)) {
+            good++;
+            close_connection(c);
+            return 2;
+        }
+        /* catch legitimate fatal apr_socket_recv errors */
+        else if (status != APR_SUCCESS) {
+            err_recv++;
+            if (recverrok) {
+                bad++;
+                close_connection(c);
+                if (verbosity >= 1) {
+                    char buf[120];
+                    fprintf(stderr,"%s: %s (%d)\n", "http-connect apr_socket_recv", apr_strerror(status, buf, sizeof buf), status);
+                }
+            } else {
+                apr_err("http-connect apr_socket_recv", status);
+            }
+            return 2;
+        }
+    }
+
+    // bypass verify of response, "HTTP/1.1 200 Connection established"
+    if (r <= 10)
+    {
+        if (verbosity >= 1) {
+            char buf[120];
+            fprintf(stderr,"http-connect response error, return len < 10 bytes, %d\n", status);
+            close_connection(c);
+         }
+        return 2;
+    }
+
+    return 0;
+}
+
+/* --------------------------------------------------------- */
+
 /* run the tests */
 
 static void test(void)
@@ -1624,6 +1729,28 @@ static void test(void)
     }
     else {
         /* Header overridden, no need to add, as it is already in hdrs */
+    }
+
+    /* setup http tunnel, http-connect request */
+    if (forward_conn == 1)
+    {
+        snprintf_res = apr_snprintf(conn_request, sizeof(_conn_request),
+            "%s %s" ":443 HTTP/1.1\r\n"
+            "User-Agent: Wget/1.20.3 (linux-gnu)\r\n"
+            "Host: %s" ":443\r\n"
+            "\r\n",
+            "CONNECT",
+            hostname,
+            hostname);
+
+        if (snprintf_res >= sizeof(_conn_request)) {
+            err("HTTP-Connect Request too long\n");
+        }
+
+        if (verbosity >= 2)
+            printf("INFO: HTTP-CONNECT header == \n---\n%s\n---\n", conn_request);
+
+        conn_reqlen = snprintf_res;
     }
 
     /* setup request */
@@ -1787,6 +1914,19 @@ static void test(void)
                         start_connect(c);
                         continue;
                     }
+                    else if ((forward_conn) & (c->tunnel_up != 2)) {
+                        if (c->tunnel_up == 0)
+                        {
+                            write_conn_request(c);
+                            c->tunnel_up = 1;
+                        }
+                        else if ((c->tunnel_up == 1) & (read_connection_conn_ack(c) == 0))
+                        {
+                            c->tunnel_up = 2;
+                        }
+                        else
+                            continue;
+                    }
                     else {
                         set_conn_state(c, STATE_CONNECTED);
                         started++;
@@ -1880,6 +2020,7 @@ static void usage(const char *progname)
 #ifdef USE_SSL
     fprintf(stderr, "    -Z ciphersuite  Specify SSL/TLS cipher suite (See openssl ciphers)\n");
     fprintf(stderr, "    -f protocol     Specify SSL/TLS protocol (SSL2, SSL3, TLS1, or ALL)\n");
+    fprintf(stderr, "    -F              Enable http tunnel (http-connect) before ssl forwarding \n");
 #endif
     exit(EINVAL);
 }
@@ -2045,15 +2186,15 @@ int main(int argc, const char * const argv[])
 #endif
 
     apr_getopt_init(&opt, cntxt, argc, argv);
-    while ((status = apr_getopt(opt, "n:c:t:b:T:p:v:rkVhwix:y:z:C:H:P:A:g:X:de:Sq"
+    while ((status = apr_getopt(opt, "n:c:t:b:T:p:v:rFkVhwix:y:z:C:H:P:A:g:X:de:Sq"
 #ifdef USE_SSL
             "Z:f:"
 #endif
-            ,&c, &optarg)) == APR_SUCCESS) {
+            "W:",&c, &optarg)) == APR_SUCCESS) {
         switch (c) {
             case 'n':
                 requests = atoi(optarg);
-                if (requests <= 0) {
+                if (requests < 0) {
                     err("Invalid number of requests\n");
                 }
                 break;
@@ -2098,6 +2239,9 @@ int main(int argc, const char * const argv[])
                 break;
             case 'r':
                 recverrok = 1;
+                break;
+            case 'F':
+                forward_conn = 1;
                 break;
             case 'v':
                 verbosity = atoi(optarg);
@@ -2208,9 +2352,13 @@ int main(int argc, const char * const argv[])
                 if (strncasecmp(optarg, "ALL", 3) == 0) {
                     meth = SSLv23_client_method();
                 } else if (strncasecmp(optarg, "SSL2", 4) == 0) {
-                    meth = SSLv2_client_method();
+                    meth = SSLv23_client_method();
                 } else if (strncasecmp(optarg, "SSL3", 4) == 0) {
-                    meth = SSLv3_client_method();
+                    meth = SSLv23_client_method();
+                } else if (strncasecmp(optarg, "TLS1.3", 6) == 0) {
+                    meth = TLS_client_method();
+                } else if (strncasecmp(optarg, "TLS1.2", 6) == 0) {
+                    meth = TLSv1_2_client_method();
                 } else if (strncasecmp(optarg, "TLS1", 4) == 0) {
                     meth = TLSv1_client_method();
                 }
@@ -2235,11 +2383,13 @@ int main(int argc, const char * const argv[])
         usage(argv[0]);
     }
 
+#if 0
     if (concurrency > requests) {
         fprintf(stderr, "%s: Cannot use concurrency level greater than "
                 "total number of requests\n", argv[0]);
         usage(argv[0]);
     }
+#endif
 
     if ((heartbeatres) && (requests > 150)) {
         heartbeatres = requests / 10;   /* Print line every 10% of requests */
@@ -2254,7 +2404,9 @@ int main(int argc, const char * const argv[])
 #ifdef RSAREF
     R_malloc_init();
 #else
-    CRYPTO_malloc_init();
+    //$a
+    //CRYPTO_malloc_init();
+    OPENSSL_malloc_init();
 #endif
     SSL_load_error_strings();
     SSL_library_init();
