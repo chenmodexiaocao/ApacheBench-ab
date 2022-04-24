@@ -154,7 +154,11 @@
 #include <semaphore.h>
 #include <string.h>
 #include <errno.h>
-
+#include <stdint.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <sys/sysinfo.h>
 
 #define APR_WANT_STRFUNC
 #include <apr_want.h>
@@ -219,6 +223,7 @@ typedef STACK_OF(X509) X509_STACK_TYPE;
 #if APR_HAVE_LIMITS_H
 #include <limits.h>
 #endif
+#include <pthread.h>
 
 /* ------------------- DEFINITIONS -------------------------- */
 
@@ -272,6 +277,7 @@ struct connection {
     int socknum;
 #ifdef USE_SSL
     SSL *ssl;
+    int ssl_handshake_status;   /* 0 success , -1 error */
 #endif
 };
 
@@ -356,6 +362,9 @@ int err_response = 0;      /* requests with invalid or non-200 response */
 int worker_num = 1;
 char ab_work_sem [80] = {0};
 #define AB_WORKER_SEM  ab_work_sem
+char ab_shm_ssl_statistic [80] = {0};
+#define AB_SHM_SSL_STATISTIC  ab_shm_ssl_statistic
+int enable_static_statistic = 0;
 
 #ifdef USE_SSL
 int is_ssl;
@@ -394,6 +403,19 @@ apr_sockaddr_t *destsa;
 #ifdef NOT_ASCII
 apr_xlate_t *from_ascii, *to_ascii;
 #endif
+
+typedef struct ssl_statistic {
+    uint64_t connection_counter;
+    uint64_t handshake_counter;
+    uint64_t request_done_counter;
+    uint64_t normal_close_counter;
+    uint64_t error_counter;
+    uint64_t reserve[3];
+} ssl_statistic_t;
+
+static ssl_statistic_t *curr_ssl_statistic = NULL;
+static int cpu_list[1024] = {0};
+static int cpu_list_len = 0;
 
 static void write_request(struct connection * c);
 static void close_connection(struct connection * c);
@@ -642,6 +664,12 @@ static void ssl_proceed_handshake(struct connection *c)
 
         switch (ecode) {
         case SSL_ERROR_NONE:
+            if (curr_ssl_statistic) {
+                curr_ssl_statistic->handshake_counter++;
+            }
+#ifdef USE_SSL
+            c->ssl_handshake_status = 0; /* success */
+#endif //USE_SSL
             if (verbosity >= 2)
                 ssl_print_info(c);
             if (ssl_info == NULL) {
@@ -680,6 +708,12 @@ static void ssl_proceed_handshake(struct connection *c)
             /* Unexpected result */
             BIO_printf(bio_err, "SSL handshake failed (%d).\n", ecode);
             ERR_print_errors(bio_err);
+            if (curr_ssl_statistic) {
+                curr_ssl_statistic->error_counter++;
+            }
+#ifdef USE_SSL
+            c->ssl_handshake_status = -1; /* success */
+#endif //USE_SSL
             close_connection(c);
             do_next = 0;
             break;
@@ -1310,6 +1344,9 @@ static void start_connect(struct connection * c)
         if (APR_STATUS_IS_EINPROGRESS(rv)) {
             set_conn_state(c, STATE_CONNECTING);
             c->rwrite = 0;
+            if (curr_ssl_statistic) {
+                curr_ssl_statistic->connection_counter++;
+            }
             return;
         }
         else {
@@ -1327,6 +1364,9 @@ static void start_connect(struct connection * c)
         }
     }
 
+    if (curr_ssl_statistic) {
+        curr_ssl_statistic->connection_counter++;
+    }
     /* connected first time */
     set_conn_state(c, STATE_CONNECTED);
     started++;
@@ -1346,6 +1386,11 @@ static void start_connect(struct connection * c)
 
 static void close_connection(struct connection * c)
 {
+    if (curr_ssl_statistic) {
+        if (c->ssl_handshake_status == 0) {
+            curr_ssl_statistic->normal_close_counter++;
+        }
+    }
     if (c->read == 0 && c->keepalive) {
         /*
          * server has legitimately shut down an idle keep alive request
@@ -1696,13 +1741,15 @@ static void test(void)
         connectport = port;
     }
 
-    if (!use_html) {
-        printf("Benchmarking %s ", hostname);
-    if (isproxy)
-        printf("[through %s:%d] ", proxyhost, proxyport);
-    printf("(be patient)%s",
-           (heartbeatres ? "\n" : "..."));
-    fflush(stdout);
+    if (!enable_static_statistic) {
+        if (!use_html) {
+            printf("Benchmarking %s ", hostname);
+        if (isproxy)
+            printf("[through %s:%d] ", proxyhost, proxyport);
+        printf("(be patient)%s",
+               (heartbeatres ? "\n" : "..."));
+        fflush(stdout);
+        }
     }
 
     con = calloc(concurrency, sizeof(struct connection));
@@ -2030,6 +2077,9 @@ static void usage(const char *progname)
     fprintf(stderr, "    -f protocol     Specify SSL/TLS protocol (SSL2, SSL3, TLS1, or ALL)\n");
     fprintf(stderr, "    -F              Enable http tunnel (http-connect) before ssl forwarding \n");
 #endif
+    fprintf(stderr, "    -W  num        Fork num ab process. \n");
+    fprintf(stderr, "    -L  lcorelist  Fork process lcore list. \n");
+    fprintf(stderr, "    -M             Enable static statistic counter. \n");
     exit(EINVAL);
 }
 
@@ -2143,6 +2193,104 @@ static int open_postfile(const char *pfile)
     return 0;
 }
 
+void ssl_statistic_handler(ssl_statistic_t *ssl_statistic_array, int array_num)
+{
+    struct timespec  ts= {0};
+    uint64_t old_nsec_counter = 0;
+    uint64_t nsec_counter = 0;
+    uint64_t diff_nsec_counter = 0;
+    ssl_statistic_t old_ssl_statistic = {0};
+    ssl_statistic_t ssl_statistic = {0};
+    int i;
+
+    printf("| connection | conn /second | handshake  |handshake/second|normal close| close/second |  error  | error /second|\n");
+    clock_gettime (CLOCK_REALTIME, &ts);
+    nsec_counter = ((uint64_t)ts.tv_sec) *1000000000 + (uint64_t )ts.tv_nsec;
+    old_nsec_counter = nsec_counter;
+    for ( ; ;) {
+        memset(&ssl_statistic, 0, sizeof(ssl_statistic));
+        for (i = 0; i < array_num; i++) {
+            ssl_statistic.connection_counter += ssl_statistic_array[i].connection_counter;
+            ssl_statistic.handshake_counter += ssl_statistic_array[i].handshake_counter;
+            ssl_statistic.normal_close_counter += ssl_statistic_array[i].normal_close_counter;
+            ssl_statistic.error_counter += ssl_statistic_array[i].error_counter;
+            ssl_statistic.request_done_counter += ssl_statistic_array[i].request_done_counter;
+        }
+
+        clock_gettime(CLOCK_REALTIME, &ts);
+        nsec_counter = ((uint64_t)ts.tv_sec) *1000000000 + (uint64_t )ts.tv_nsec;
+        diff_nsec_counter = nsec_counter - old_nsec_counter;
+        printf("|%12llu|%10.2f/sec|%12llu|%12.2f/sec|%12llu|%10.2f/sec|%9llu|%10.2f/sec|\n", ssl_statistic.connection_counter,
+            (ssl_statistic.connection_counter - old_ssl_statistic.connection_counter)
+             * 1000000000.0 /diff_nsec_counter, ssl_statistic.handshake_counter,
+            (ssl_statistic.handshake_counter - old_ssl_statistic.handshake_counter)
+            * 1000000000.0 /diff_nsec_counter, ssl_statistic.normal_close_counter,
+            (ssl_statistic.normal_close_counter - old_ssl_statistic.normal_close_counter)
+            * 1000000000.0 /diff_nsec_counter, ssl_statistic.error_counter,
+            (ssl_statistic.error_counter - old_ssl_statistic.error_counter)
+            * 1000000000.0 /diff_nsec_counter);
+        old_ssl_statistic = ssl_statistic;
+        old_nsec_counter = nsec_counter;
+        sleep(2);
+    }
+}
+
+int parse_cpu_list(const char *cpu_list_str)
+{
+    int sys_cpu_num;
+    char *cpu_array_start = NULL;
+    char *cpu_array_end = NULL;
+    char *cpu_array_sep = NULL;
+    char *tmp_cpu_list;
+    int cpu_min_num;
+    int cpu_max_num;
+
+    sys_cpu_num = get_nprocs();
+    tmp_cpu_list = strdup(cpu_list_str);
+    for (tmp_cpu_list; tmp_cpu_list; ) {
+        cpu_array_start = tmp_cpu_list;
+        cpu_array_end = strchr(tmp_cpu_list, ';');
+        if (cpu_array_end) {
+            cpu_array_end[0] = '\0';
+            tmp_cpu_list = cpu_array_end + 1;
+        }
+        else {
+            tmp_cpu_list = NULL;
+        }
+        cpu_array_sep = strchr(cpu_array_start, '-');
+        if (cpu_array_sep) {
+            cpu_array_sep[0] = '\0';
+            cpu_min_num = atoi(cpu_array_start);
+            cpu_max_num = atoi(cpu_array_sep + 1);
+            if (cpu_min_num > cpu_max_num || cpu_min_num > sys_cpu_num ||
+                cpu_max_num > sys_cpu_num) {
+                goto fail;
+            }
+            for (; cpu_min_num <= cpu_max_num; cpu_min_num++) {
+                cpu_list[cpu_list_len] = cpu_min_num;
+                cpu_list_len++;
+            }
+        }
+        else {
+            cpu_min_num = atoi(cpu_array_start);
+            if (cpu_min_num > sys_cpu_num) {
+                goto fail;
+            }
+            cpu_list[cpu_list_len] = cpu_min_num;
+            cpu_list_len++;
+        }
+
+    }
+    free(tmp_cpu_list);
+    return 0;
+
+fail:
+    if (tmp_cpu_list) {
+        free(tmp_cpu_list);
+    }
+    return -1;
+}
+
 /* ------------------------------------------------------- */
 
 /* sort out command-line args and call test */
@@ -2156,6 +2304,9 @@ int main(int argc, const char * const argv[])
     char c;
     sem_t *worker_sem;
     int inited_worker_num = 0;
+    ssl_statistic_t *ssl_statistic_array = NULL;
+    int ssl_statistic_fd = -1;
+    cpu_set_t cpuset;
 
 #ifdef USE_SSL
 #if OPENSSL_VERSION_NUMBER >= 0x00909000
@@ -2201,7 +2352,7 @@ int main(int argc, const char * const argv[])
 #ifdef USE_SSL
             "Z:f:"
 #endif
-            "W:",&c, &optarg)) == APR_SUCCESS) {
+            "W:L:M",&c, &optarg)) == APR_SUCCESS) {
         switch (c) {
             case 'n':
                 requests = atoi(optarg);
@@ -2358,6 +2509,15 @@ int main(int argc, const char * const argv[])
             case 'W':
                 worker_num = atoi(optarg);
                 break;
+            case 'L':
+                if (parse_cpu_list(optarg) != 0) {
+                     fprintf(stderr, "invalid lcore list");
+                     exit(0);
+                }
+                break;
+            case 'M':
+                enable_static_statistic = 1;
+                break;
 #ifdef USE_SSL
             case 'Z':
                 ssl_cipher = strdup(optarg);
@@ -2450,26 +2610,64 @@ int main(int argc, const char * const argv[])
                                          * have been closed at the other end. */
 #endif
     copyright();
-    snprintf(AB_WORKER_SEM, sizeof(AB_WORKER_SEM), "ab_worker_sem_%d", getpid());
-    sem_unlink(AB_WORKER_SEM);
-    if ((worker_sem = sem_open(AB_WORKER_SEM, O_CREAT | O_EXCL | O_RDWR, 0644, 0)) == NULL) {
-        fprintf(stderr, "sem_open fail (%s)!\n", strerror(errno));
-        return 0;
-    }
 
-    for (i = 1; i < worker_num; i++) {
-        if (fork() == 0)
-            break;
-    }
-    sem_post(worker_sem);
-    while (1) {
-        sem_getvalue(worker_sem, &inited_worker_num);
-        if (inited_worker_num >= worker_num) {
-            break;
+    worker_num = worker_num < 1 ? 1 : worker_num;
+    if (enable_static_statistic) {
+        snprintf(AB_SHM_SSL_STATISTIC, sizeof(AB_SHM_SSL_STATISTIC), "ab_shm_ssl_statistic_%d", getpid());
+        shm_unlink(AB_SHM_SSL_STATISTIC);
+        if ((ssl_statistic_fd = shm_open(AB_SHM_SSL_STATISTIC, O_RDWR | O_CREAT, 0777)) == -1) {
+            exit(0);
         }
+        if (ftruncate(ssl_statistic_fd, sizeof(ssl_statistic_t) * worker_num) != 0) {
+            exit(0);
+        }
+        ssl_statistic_array = mmap(NULL, sizeof(ssl_statistic_t) * worker_num,
+            PROT_WRITE | PROT_READ , MAP_SHARED, ssl_statistic_fd, 0);
+
+        memset(ssl_statistic_array, 0, sizeof(ssl_statistic_t) * worker_num);
+        if (fork() != 0) {
+            shm_unlink(AB_SHM_SSL_STATISTIC);
+            ssl_statistic_handler(ssl_statistic_array, worker_num);
+            return 0;
+        }
+        curr_ssl_statistic = ssl_statistic_array;
+        heartbeatres = 0;
     }
-    sem_close(worker_sem);
-    sem_unlink(AB_WORKER_SEM);
+    if (cpu_list_len) {
+        CPU_ZERO(&cpuset);
+        CPU_SET(cpu_list[0], &cpuset);
+        pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+    }
+    if (worker_num > 1) {
+        snprintf(AB_WORKER_SEM, sizeof(AB_WORKER_SEM), "ab_worker_sem_%d", getpid());
+        sem_unlink(AB_WORKER_SEM);
+        if ((worker_sem = sem_open(AB_WORKER_SEM, O_CREAT | O_EXCL | O_RDWR, 0644, 0)) == NULL) {
+            fprintf(stderr, "sem_open fail (%s)!\n", strerror(errno));
+            return 0;
+        }
+        for (i = 1; i < worker_num; i++) {
+            if (fork() == 0) {
+                if (cpu_list_len) {
+                    CPU_ZERO(&cpuset);
+                    CPU_SET(cpu_list[i%cpu_list_len], &cpuset);
+                    pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+                }
+                if (enable_static_statistic) {
+                    curr_ssl_statistic = ssl_statistic_array + i;
+                }
+                break;
+            }
+        }
+        sem_post(worker_sem);
+        while (1) {
+            sem_getvalue(worker_sem, &inited_worker_num);
+            if (inited_worker_num >= worker_num) {
+                break;
+            }
+        }
+        sem_close(worker_sem);
+        sem_unlink(AB_WORKER_SEM);
+    }
     test();
     apr_pool_destroy(cntxt);
 
