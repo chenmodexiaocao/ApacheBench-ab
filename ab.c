@@ -372,6 +372,7 @@ SSL_CTX *ssl_ctx;
 char *ssl_cipher = NULL;
 char *ssl_info = NULL;
 BIO *bio_out,*bio_err;
+char *ssl_ecdh_curve = NULL;
 #endif
 
 apr_time_t start, lasttime, stoptime;
@@ -2076,6 +2077,7 @@ static void usage(const char *progname)
     fprintf(stderr, "    -Z ciphersuite  Specify SSL/TLS cipher suite (See openssl ciphers)\n");
     fprintf(stderr, "    -f protocol     Specify SSL/TLS protocol (SSL2, SSL3, TLS1, or ALL)\n");
     fprintf(stderr, "    -F              Enable http tunnel (http-connect) before ssl forwarding \n");
+    fprintf(stderr, "    -D              Specify SSL/TLS  ECDH curve list (See openssl ciphers) \n");
 #endif
     fprintf(stderr, "    -W  num        Fork num ab process. \n");
     fprintf(stderr, "    -L  lcorelist  Fork process lcore list. \n");
@@ -2350,7 +2352,7 @@ int main(int argc, const char * const argv[])
     apr_getopt_init(&opt, cntxt, argc, argv);
     while ((status = apr_getopt(opt, "n:c:t:b:T:p:v:rFkVhwix:y:z:C:H:P:A:g:X:de:Sq"
 #ifdef USE_SSL
-            "Z:f:"
+            "Z:f:D:"
 #endif
             "W:L:M",&c, &optarg)) == APR_SUCCESS) {
         switch (c) {
@@ -2537,6 +2539,9 @@ int main(int argc, const char * const argv[])
                     meth = TLSv1_client_method();
                 }
                 break;
+            case 'D':
+                ssl_ecdh_curve = strdup(optarg);
+                break;
 #endif
         }
     }
@@ -2597,9 +2602,16 @@ int main(int argc, const char * const argv[])
         if (!SSL_CTX_set_cipher_list(ssl_ctx, ssl_cipher) &&
             !SSL_CTX_set_ciphersuites(ssl_ctx, ssl_cipher)) {
             fprintf(stderr, "error setting cipher list [%s]\n", ssl_cipher);
-        ERR_print_errors_fp(stderr);
-        exit(1);
+            ERR_print_errors_fp(stderr);
+            exit(1);
+        }
     }
+    if (ssl_ecdh_curve != NULL) {
+        if (SSL_CTX_set1_curves_list(ssl_ctx, ssl_ecdh_curve) == 0) {
+            fprintf(stderr, "error setting ecdh_curves list [%s]\n", ssl_ecdh_curve);
+            ERR_print_errors_fp(stderr);
+            exit(1);
+        }
     }
     if (verbosity >= 3) {
         SSL_CTX_set_info_callback(ssl_ctx, ssl_state_cb);
